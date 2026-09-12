@@ -151,7 +151,12 @@ Sub ImportBOTPromoData()
         MsgBox "Could not open the BOT Promo Collation workbook. Import cancelled.", vbExclamation
         GoTo CleanExit
     End If
-    Set wsBOT = wbBOT.Sheets(BOT_SHEET_NAME)
+    Set wsBOT = FindSheetLoose(wbBOT, BOT_SHEET_NAME)
+    If wsBOT Is Nothing Then
+        MsgBox "Could not find a sheet named '" & BOT_SHEET_NAME & "' in workbook '" & wbBOT.Name & "'." & vbCrLf & _
+               "Actual tab names in that workbook are:" & vbCrLf & ListSheetNames(wbBOT), vbCritical
+        GoTo CleanExit
+    End If
 
     ' ---- 2. Read BOT headers and find last row --------------------------------
     Set hdrBOT = GetHeaderMap(wsBOT, 1)
@@ -286,7 +291,12 @@ Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit 
     Dim requiredHeaders As Variant
     Dim missingHeaders As String
 
-    Set ws = wb.Sheets(sheetName)
+    Set ws = FindSheetLoose(wb, sheetName)
+    If ws Is Nothing Then
+        Err.Raise vbObjectError + 2, "PrepareTargetSheet", _
+            "Could not find a sheet named '" & sheetName & "' in workbook '" & wb.Name & "'." & vbCrLf & _
+            "Actual tab names in this workbook are:" & vbCrLf & ListSheetNames(wb)
+    End If
     Set hdr = GetHeaderMap(ws, 1)
 
     If isExit Then
@@ -502,6 +512,41 @@ Private Function GetHeaderMap(ws As Worksheet, headerRow As Long) As Object
     Next c
 
     Set GetHeaderMap = dict
+End Function
+
+
+'===================================================================================
+'  Find a worksheet by name, tolerant of leading/trailing whitespace and case
+'  (Excel tab names are case-insensitive for uniqueness anyway). Returns Nothing
+'  instead of raising "Subscript out of range" when no match exists, so callers
+'  can report a helpful error with the workbook's actual tab names.
+'===================================================================================
+Private Function FindSheetLoose(wb As Workbook, sheetName As String) As Worksheet
+    Dim ws As Worksheet
+    Dim target As String
+    target = Trim$(sheetName)
+
+    For Each ws In wb.Worksheets
+        If StrComp(Trim$(ws.Name), target, vbTextCompare) = 0 Then
+            Set FindSheetLoose = ws
+            Exit Function
+        End If
+    Next ws
+
+    Set FindSheetLoose = Nothing
+End Function
+
+
+'===================================================================================
+'  CrLf-joined list of every worksheet tab name in a workbook, for error messages.
+'===================================================================================
+Private Function ListSheetNames(wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim result As String
+    For Each ws In wb.Worksheets
+        result = result & "  - '" & ws.Name & "'" & vbCrLf
+    Next ws
+    ListSheetNames = result
 End Function
 
 
