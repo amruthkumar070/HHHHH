@@ -17,9 +17,12 @@ Option Explicit
 '  1) "CAG" in the request is assumed to be the column headed "CAYG" in the
 '     BOT workbook (there is no column literally called "CAG"). If that is
 '     wrong, change BOT_HDR_CAG below to the correct header text.
-'  2) The two country columns in BOT ("country" = full name, "Country" = 2
-'     letter code SK/HU/CZ) always agreed in the sample file, so routing uses
-'     the 2-letter code column ("Country").
+'  2) Country routing reads column D of the BOT sheet directly (by position,
+'     not by header text), because that column holds full country names
+'     ("Czech Republic" / "Slovakia" / "Hungary") rather than a 2-letter code.
+'     CountryNameToCode() maps those names (and the bare codes, if ever used)
+'     to CZ/SK/HU; anything else is counted as an unmapped/unrecognised row.
+'     If the country moves to a different column, update BOT_COUNTRY_COL.
 '  3) "Start date" / "End date" are taken from BOT's "startdate"/"enddate"
 '     columns (not the second pair "Start date"/"End date", which differed
 '     in the sample file and looked like a reconciled/STRAPP date).
@@ -52,6 +55,12 @@ Option Explicit
 '  MISSING HEADERS: if any BOT or destination header referenced below is not
 '  found on its sheet, ImportBOTPromoData aborts up front and lists exactly
 '  which ones are missing, rather than silently importing blank columns.
+'
+'  MISSING SHEETS: if a destination sheet (CZ/SK/HU/CZ EXIT/SK EXIT/HU EXIT)
+'  doesn't exist in this workbook, it is created automatically with the
+'  expected header row (see CreateTargetSheet) rather than raising an error.
+'  Sheet name matching also tolerates case and stray spacing differences
+'  (e.g. "Sheet1" vs "Sheet 1") - see FindSheetLoose.
 '===================================================================================
 
 ' ---- Configuration you may want to tweak -----------------------------------------
@@ -75,8 +84,12 @@ Private Const BOT_HDR_DRGDESC    As String = "DRG description"
 Private Const BOT_HDR_TYPE       As String = "OOCP/CP"
 Private Const BOT_HDR_REASON     As String = "Reason"
 Private Const BOT_HDR_ITEMDESC   As String = "Item description"
-Private Const BOT_HDR_COUNTRYCD  As String = "Country"       ' 2-letter code column (SK/HU/CZ)
 Private Const BOT_HDR_CAG        As String = "CAYG"          ' <-- assumption, see header notes
+
+' Country is read positionally from column D of the BOT sheet (not by header text) -
+' the source file has full country names there (e.g. "Czech Republic"), not the
+' 2-letter code the header-based lookup originally assumed.
+Private Const BOT_COUNTRY_COL    As Long = 4   ' column D
 
 Private Const DEST_HDR_FROM      As String = "From"
 Private Const DEST_HDR_ITEM      As String = "Item"
@@ -101,9 +114,10 @@ Private Const EXIT_HDR_STORE     As String = "Store number"
 Private Const IMPORT_SUBJECT_TAG As String = "BOT Import"
 
 ' Headers that MUST exist on the BOT sheet for the import to make sense.
-' (This list intentionally excludes DEST_HDR_ITEMDESC, which is HU-only.)
+' (This list intentionally excludes DEST_HDR_ITEMDESC, which is HU-only, and
+' the country column, which is read positionally from BOT_COUNTRY_COL instead.)
 Private Const REQUIRED_BOT_HEADERS As String = "tpn|storenumber|buyername|promonames|startdate|enddate|" & _
-    "Department description|Division description|DRG|DRG description|OOCP/CP|Reason|Item description|Country|CAYG"
+    "Department description|Division description|DRG|DRG description|OOCP/CP|Reason|Item description|CAYG"
 
 ' ---- Small helper type to bundle everything we need for one destination sheet ----
 Private Type TargetSheet
@@ -188,7 +202,7 @@ Sub ImportBOTPromoData()
         tpnVal = GetVal(wsBOT, r, hdrBOT, BOT_HDR_TPN)
         If Len(Trim$(CStr(tpnVal))) = 0 Then GoTo NextRow    ' skip completely empty rows
 
-        countryCode = Trim$(CStr(GetVal(wsBOT, r, hdrBOT, BOT_HDR_COUNTRYCD)))
+        countryCode = CountryNameToCode(CStr(wsBOT.Cells(r, BOT_COUNTRY_COL).Value))
 
         Select Case UCase$(countryCode)
             Case "CZ": tMain = tCZ: tExit = eCZ
@@ -276,6 +290,46 @@ End Function
 
 
 '===================================================================================
+'  Create a destination sheet with the header row a fresh CZ/SK/HU (or EXIT)
+'  sheet needs, when it doesn't already exist in this workbook. Main sheets get
+'  every DEST_HDR_* column except "Item Description" (HU-only per the original
+'  design); EXIT sheets get just TPN + Store number, since Department/Format/
+'  Division on EXIT sheets are meant to be filled by lookup formulas the user
+'  adds afterwards - this macro never invents those formulas.
+'===================================================================================
+Private Function CreateTargetSheet(wb As Workbook, sheetName As String, isExit As Boolean) As Worksheet
+    Dim ws As Worksheet
+    Dim headers As Variant
+    Dim c As Long
+
+    Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+    ws.Name = sheetName
+
+    If isExit Then
+        headers = Array(EXIT_HDR_TPN, EXIT_HDR_STORE)
+    Else
+        headers = Array(DEST_HDR_FROM, DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_PROMOWEEK, _
+                         DEST_HDR_STARTDATE, DEST_HDR_ENDDATE, DEST_HDR_DEPT, DEST_HDR_DIV, _
+                         DEST_HDR_REASON, DEST_HDR_DRG, DEST_HDR_DRGNAME, DEST_HDR_TYPE, _
+                         DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK)
+        If UCase$(sheetName) = "HU" Then
+            headers = Array(DEST_HDR_FROM, DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_ITEMDESC, _
+                             DEST_HDR_PROMOWEEK, DEST_HDR_STARTDATE, DEST_HDR_ENDDATE, DEST_HDR_DEPT, _
+                             DEST_HDR_DIV, DEST_HDR_REASON, DEST_HDR_DRG, DEST_HDR_DRGNAME, _
+                             DEST_HDR_TYPE, DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK)
+        End If
+    End If
+
+    For c = LBound(headers) To UBound(headers)
+        ws.Cells(1, c + 1).Value = headers(c)
+    Next c
+    ws.Rows(1).Font.Bold = True
+
+    Set CreateTargetSheet = ws
+End Function
+
+
+'===================================================================================
 '  Build a TargetSheet structure: header map, formula-column map, dedup keys
 '===================================================================================
 Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit As Boolean) As TargetSheet
@@ -293,9 +347,7 @@ Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit 
 
     Set ws = FindSheetLoose(wb, sheetName)
     If ws Is Nothing Then
-        Err.Raise vbObjectError + 2, "PrepareTargetSheet", _
-            "Could not find a sheet named '" & sheetName & "' in workbook '" & wb.Name & "'." & vbCrLf & _
-            "Actual tab names in this workbook are:" & vbCrLf & ListSheetNames(wb)
+        Set ws = CreateTargetSheet(wb, sheetName, isExit)
     End If
     Set hdr = GetHeaderMap(ws, 1)
 
@@ -526,8 +578,19 @@ Private Function FindSheetLoose(wb As Workbook, sheetName As String) As Workshee
     Dim target As String
     target = Trim$(sheetName)
 
+    ' Pass 1: exact match, ignoring case and leading/trailing whitespace only
     For Each ws In wb.Worksheets
         If StrComp(Trim$(ws.Name), target, vbTextCompare) = 0 Then
+            Set FindSheetLoose = ws
+            Exit Function
+        End If
+    Next ws
+
+    ' Pass 2: match with ALL internal spaces stripped too, so "Sheet1" matches
+    ' a real tab named "Sheet 1" (a mismatch that otherwise fails with a bare
+    ' "Subscript out of range" error).
+    For Each ws In wb.Worksheets
+        If StrComp(Replace(ws.Name, " ", ""), Replace(target, " ", ""), vbTextCompare) = 0 Then
             Set FindSheetLoose = ws
             Exit Function
         End If
@@ -547,6 +610,29 @@ Private Function ListSheetNames(wb As Workbook) As String
         result = result & "  - '" & ws.Name & "'" & vbCrLf
     Next ws
     ListSheetNames = result
+End Function
+
+
+'===================================================================================
+'  Map a country name from BOT column D (e.g. "Czech Republic") to the 2-letter
+'  code used for routing and sheet names (CZ/SK/HU). Also accepts the code
+'  itself, in case column D ever holds "CZ"/"SK"/"HU" directly. Returns "" for
+'  anything unrecognised, which the caller counts as an "unmapped" row.
+'===================================================================================
+Private Function CountryNameToCode(countryText As String) As String
+    Dim t As String
+    t = UCase$(Trim$(countryText))
+
+    Select Case t
+        Case "CZ", "CZECH REPUBLIC", "CZECHIA", "CZECH"
+            CountryNameToCode = "CZ"
+        Case "SK", "SLOVAKIA", "SLOVAK REPUBLIC"
+            CountryNameToCode = "SK"
+        Case "HU", "HUNGARY"
+            CountryNameToCode = "HU"
+        Case Else
+            CountryNameToCode = ""
+    End Select
 End Function
 
 
