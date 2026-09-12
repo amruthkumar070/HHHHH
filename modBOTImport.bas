@@ -45,10 +45,11 @@ Option Explicit
 '     formula from the row directly above is copied down instead, so all
 '     existing formulas in the workbook are fully preserved.
 '  7) Fields with no obvious source in BOT ("Promo num", "Active Open Links
-'     in Stores") are left blank. "Subject" is stamped with a constant tag
-'     and "Received" with today's date, purely so the row is traceable back
-'     to this import - change the two constants below if you'd rather have
-'     something else.
+'     in Stores") are left blank. "Received" is stamped with today's date.
+'     "Subject" is stamped "1P" when BOT's "itemdescription" column starts
+'     with "1P" (e.g. "1P PROMO - PLEASE STICK TO THE REQUESTED DATES"), and
+'     "MRT Webforms - Nomination Tool" otherwise - see DetermineSubjectTag
+'     and the SUBJECT_TAG_* constants if you'd rather have different text.
 '  8) The macro is safe to re-run: it builds a duplicate-check on
 '     TPN+Store+StartDate (main sheets) and TPN+Store (EXIT sheets) from the
 '     rows already in the sheet, so re-importing the same BOT export will
@@ -83,6 +84,10 @@ Private Const BOT_HDR_DRGDESC    As String = "DRG description"
 Private Const BOT_HDR_TYPE       As String = "OOCP/CP"
 Private Const BOT_HDR_REASON     As String = "Reason"
 Private Const BOT_HDR_ITEMDESC   As String = "Item description"
+Private Const BOT_HDR_ITEMFLAG   As String = "itemdescription"  ' NOT the same column as BOT_HDR_ITEMDESC -
+                                                                  ' distinct header, differs only by case/spacing;
+                                                                  ' holds "1P PROMO - ..." on some rows, used to
+                                                                  ' pick the Subject tag (see DetermineSubjectTag)
 Private Const BOT_HDR_CAG        As String = "CAYG"          ' <-- assumption, see header notes
 
 ' Country is read positionally from column D of the BOT sheet (not by header text) -
@@ -106,11 +111,21 @@ Private Const DEST_HDR_TYPE      As String = "Type"
 Private Const DEST_HDR_SUBJECT   As String = "Subject"
 Private Const DEST_HDR_RECEIVED  As String = "Received"
 Private Const DEST_HDR_MINUSWK   As String = "Minus week until promo starts"
+Private Const DEST_HDR_FORMAT    As String = "Format"                        ' formula-driven, see note 6
+Private Const DEST_HDR_PROMONUM  As String = "Promo num"                     ' no source in BOT, left blank
+Private Const DEST_HDR_ACTIVELNK As String = "Active Open Links in Stores"   ' no source in BOT, left blank
 
 Private Const EXIT_HDR_TPN       As String = "TPN"            ' sheet has a leading space, trimmed on read
 Private Const EXIT_HDR_STORE     As String = "Store number"
+Private Const EXIT_HDR_DEPT      As String = "Department"     ' formula-driven, see note 6
+Private Const EXIT_HDR_FORMAT    As String = "Format"         ' formula-driven, see note 6
+Private Const EXIT_HDR_DIV       As String = "Division"       ' formula-driven, see note 6
 
-Private Const IMPORT_SUBJECT_TAG As String = "BOT Import"
+' Subject tag: if BOT's "itemdescription" column starts with "1P" (e.g. the real
+' data's "1P PROMO - PLEASE STICK TO THE REQUESTED DATES"), the Subject column is
+' stamped "1P"; otherwise it's stamped the standard tag below. See DetermineSubjectTag.
+Private Const SUBJECT_TAG_1P     As String = "1P"
+Private Const SUBJECT_TAG_DEFAULT As String = "MRT Webforms - Nomination Tool"
 
 ' Headers that MUST exist on the BOT sheet for the import to make sense.
 ' (This list intentionally excludes DEST_HDR_ITEMDESC, which is HU-only, and
@@ -321,12 +336,15 @@ End Function
 
 
 '===================================================================================
-'  Create a destination sheet with the header row a fresh CZ/SK/HU (or EXIT)
-'  sheet needs, when it doesn't already exist in this workbook. Main sheets get
-'  every DEST_HDR_* column except "Item Description" (HU-only per the original
-'  design); EXIT sheets get just TPN + Store number, since Department/Format/
-'  Division on EXIT sheets are meant to be filled by lookup formulas the user
-'  adds afterwards - this macro never invents those formulas.
+'  Create a destination sheet with the exact header row (text and order) that
+'  the real "Food - Promo Link EXIT Check" workbook uses, when it doesn't
+'  already exist in the new output workbook. Main sheets get every DEST_HDR_*
+'  column, with "Item Description" only on HU. EXIT sheets get TPN, Store
+'  number, Department, Format, Division. Format (main sheets) and Department/
+'  Format/Division (EXIT sheets) are formula-driven in the real workbook - on
+'  a brand new sheet there is no existing formula to copy down, so those
+'  columns are created blank; add the lookup formulas to row 2 yourself and
+'  CopyFormulaColumnsDown will extend them for every row after that.
 '===================================================================================
 Private Function CreateTargetSheet(wb As Workbook, sheetName As String, isExit As Boolean) As Worksheet
     Dim ws As Worksheet
@@ -337,17 +355,26 @@ Private Function CreateTargetSheet(wb As Workbook, sheetName As String, isExit A
     ws.Name = sheetName
 
     If isExit Then
-        headers = Array(EXIT_HDR_TPN, EXIT_HDR_STORE)
+        ' Real EXIT sheets: ' TPN', 'Store number', 'Department', 'Format', 'Division'
+        headers = Array(EXIT_HDR_TPN, EXIT_HDR_STORE, EXIT_HDR_DEPT, EXIT_HDR_FORMAT, EXIT_HDR_DIV)
     Else
-        headers = Array(DEST_HDR_FROM, DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_PROMOWEEK, _
+        ' Real CZ/SK header order: From, Subject, Received, Minus week until promo
+        ' starts, Item, Location, Format, Promo Week, Start date, End date,
+        ' Department, Division, Promo num, Reason, DRG, DRG Name, Type,
+        ' Active Open Links in Stores
+        headers = Array(DEST_HDR_FROM, DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK, _
+                         DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_FORMAT, DEST_HDR_PROMOWEEK, _
                          DEST_HDR_STARTDATE, DEST_HDR_ENDDATE, DEST_HDR_DEPT, DEST_HDR_DIV, _
-                         DEST_HDR_REASON, DEST_HDR_DRG, DEST_HDR_DRGNAME, DEST_HDR_TYPE, _
-                         DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK)
+                         DEST_HDR_PROMONUM, DEST_HDR_REASON, DEST_HDR_DRG, DEST_HDR_DRGNAME, _
+                         DEST_HDR_TYPE, DEST_HDR_ACTIVELNK)
         If UCase$(sheetName) = "HU" Then
-            headers = Array(DEST_HDR_FROM, DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_ITEMDESC, _
+            ' Real HU header order: same as above but with "Item Description"
+            ' inserted right before "Item"
+            headers = Array(DEST_HDR_FROM, DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK, _
+                             DEST_HDR_ITEMDESC, DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_FORMAT, _
                              DEST_HDR_PROMOWEEK, DEST_HDR_STARTDATE, DEST_HDR_ENDDATE, DEST_HDR_DEPT, _
-                             DEST_HDR_DIV, DEST_HDR_REASON, DEST_HDR_DRG, DEST_HDR_DRGNAME, _
-                             DEST_HDR_TYPE, DEST_HDR_SUBJECT, DEST_HDR_RECEIVED, DEST_HDR_MINUSWK)
+                             DEST_HDR_DIV, DEST_HDR_PROMONUM, DEST_HDR_REASON, DEST_HDR_DRG, _
+                             DEST_HDR_DRGNAME, DEST_HDR_TYPE, DEST_HDR_ACTIVELNK)
         End If
     End If
 
@@ -493,7 +520,8 @@ Private Sub AddMainRow(ByRef t As TargetSheet, wsBOT As Worksheet, srcRow As Lon
     WriteIfHeaderExists t, newRow, DEST_HDR_DRG, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRG)
     WriteIfHeaderExists t, newRow, DEST_HDR_DRGNAME, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRGDESC)
     WriteIfHeaderExists t, newRow, DEST_HDR_TYPE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_TYPE)
-    WriteIfHeaderExists t, newRow, DEST_HDR_SUBJECT, IMPORT_SUBJECT_TAG
+    WriteIfHeaderExists t, newRow, DEST_HDR_SUBJECT, _
+        DetermineSubjectTag(CStr(GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_ITEMFLAG)))
     WriteIfHeaderExists t, newRow, DEST_HDR_RECEIVED, Date
     ' "Promo num" and "Active Open Links in Stores" have no reliable source in BOT - left blank
 
@@ -672,6 +700,20 @@ Private Function CountryNameToCode(countryText As String) As String
         Case Else
             CountryNameToCode = ""
     End Select
+End Function
+
+
+'===================================================================================
+'  Decide the "Subject" tag for a row: if BOT's "itemdescription" column starts
+'  with "1P" (e.g. "1P PROMO - PLEASE STICK TO THE REQUESTED DATES"), stamp the
+'  Subject with "1P"; otherwise use the standard nomination-tool tag.
+'===================================================================================
+Private Function DetermineSubjectTag(itemFlagText As String) As String
+    If Left$(UCase$(Trim$(itemFlagText)), 2) = "1P" Then
+        DetermineSubjectTag = SUBJECT_TAG_1P
+    Else
+        DetermineSubjectTag = SUBJECT_TAG_DEFAULT
+    End If
 End Function
 
 
