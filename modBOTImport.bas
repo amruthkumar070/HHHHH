@@ -3,14 +3,16 @@ Option Explicit
 '===================================================================================
 '  modBOTImport
 '-----------------------------------------------------------------------------------
-'  Purpose : Read the "BOT Promo Collation" workbook, route each row by country
-'            into the CZ / SK / HU sheets of THIS workbook (Food - Promo Link
-'            EXIT Check), and copy rows where CAG/CAYG is not blank into the
-'            matching "<Country> EXIT" sheet.
+'  Purpose : Read the "BOT Promo Collation" workbook, create a BRAND NEW output
+'            workbook structured like "Food - Promo Link EXIT Check" (fresh
+'            CZ / SK / HU sheets plus a matching "<Country> EXIT" sheet for
+'            each), route each BOT row by country into the right main sheet,
+'            and copy rows where CAG/CAYG is not blank into the EXIT sheet too.
 '
-'  Run     : Open both workbooks in the same Excel session (or just this one -
-'            the macro will ask you to browse for the BOT file if it isn't
-'            already open), then run ImportBOTPromoData.
+'  Run     : Run ImportBOTPromoData. It always asks you to browse for and pick
+'            the BOT Promo Collation file (even if a copy is already open), then
+'            builds a brand new output workbook and asks where to save it - it
+'            is never written into ThisWorkbook or any other already-open file.
 '
 '  IMPORTANT ASSUMPTIONS - please review before relying on the output:
 '  --------------------------------------------------------------------
@@ -56,22 +58,17 @@ Option Explicit
 '  found on its sheet, ImportBOTPromoData aborts up front and lists exactly
 '  which ones are missing, rather than silently importing blank columns.
 '
-'  MISSING SHEETS: if a destination sheet (CZ/SK/HU/CZ EXIT/SK EXIT/HU EXIT)
-'  doesn't exist in this workbook, it is created automatically with the
-'  expected header row (see CreateTargetSheet) rather than raising an error.
-'  Sheet name matching also tolerates case and stray spacing differences
-'  (e.g. "Sheet1" vs "Sheet 1") - see FindSheetLoose.
+'  OUTPUT WORKBOOK: every run creates a brand new workbook (never writes into
+'  ThisWorkbook or any other already-open file) with fresh CZ/SK/HU/CZ EXIT/
+'  SK EXIT/HU EXIT sheets, each with the expected header row (see
+'  CreateTargetSheet). You are prompted for where to save it once the import
+'  finishes; if you cancel that prompt the workbook is left open, unsaved, so
+'  you don't lose the import.
 '===================================================================================
 
 ' ---- Configuration you may want to tweak -----------------------------------------
-Private Const BOT_WORKBOOK_HINT As String = "PROMO COLLATION" ' partial file name to find/open
-                                                                ' (matched space/underscore-insensitively by
-                                                                ' GetOrOpenWorkbook, so this also matches
-                                                                ' "PROMO_COLLATION_...", "Promo Collation
-                                                                ' Wednesday.xlsx" etc. - if it can't find a
-                                                                ' match among open workbooks it just prompts
-                                                                ' you to browse for the file)
 Private Const BOT_SHEET_NAME    As String = "Sheet1"
+Private Const OUTPUT_FILE_PREFIX As String = "Food - Promo Link EXIT Check"
 
 Private Const BOT_HDR_TPN        As String = "tpn"
 Private Const BOT_HDR_STORE      As String = "storenumber"
@@ -159,12 +156,10 @@ Sub ImportBOTPromoData()
     Application.Calculation = xlCalculationManual
     Application.EnableEvents = False
 
-    Set wbDest = ThisWorkbook
-
-    ' ---- 1. Locate the BOT source workbook -----------------------------------
-    Set wbBOT = GetOrOpenWorkbook(BOT_WORKBOOK_HINT)
+    ' ---- 1. Ask the user to pick the BOT source workbook ----------------------
+    Set wbBOT = GetOrOpenWorkbook()
     If wbBOT Is Nothing Then
-        MsgBox "Could not open the BOT Promo Collation workbook. Import cancelled.", vbExclamation
+        MsgBox "No BOT Promo Collation file was selected - import cancelled.", vbExclamation
         GoTo CleanExit
     End If
     Set wsBOT = FindSheetLoose(wbBOT, BOT_SHEET_NAME)
@@ -188,7 +183,15 @@ Sub ImportBOTPromoData()
 
     lastRowBOT = wsBOT.Cells(wsBOT.Rows.Count, hdrBOT(BOT_HDR_TPN)).End(xlUp).Row
 
-    ' ---- 3. Prepare the six destination sheets --------------------------------
+    ' ---- 3. Create a brand new output workbook (never write into an existing one) --
+    Dim wsToRemove As Worksheet, defaultSheetNames As String
+    Set wbDest = Workbooks.Add
+    defaultSheetNames = "|"
+    For Each wsToRemove In wbDest.Worksheets
+        defaultSheetNames = defaultSheetNames & wsToRemove.Name & "|"
+    Next wsToRemove
+
+    ' ---- 4. Prepare the six destination sheets --------------------------------
     ' NOTE: TargetSheet is a user-defined Type, not an object, so plain "="
     ' is used to assign it (never "Set").
     tCZ = PrepareTargetSheet(wbDest, "CZ", False)
@@ -198,7 +201,18 @@ Sub ImportBOTPromoData()
     eSK = PrepareTargetSheet(wbDest, "SK EXIT", True)
     eHU = PrepareTargetSheet(wbDest, "HU EXIT", True)
 
-    ' ---- 4. Walk every BOT row -------------------------------------------------
+    ' Now that the real sheets exist, drop the blank sheet(s) Workbooks.Add created
+    ' by default (e.g. "Sheet1") - Excel requires >=1 sheet, so this can only be
+    ' done once there's something else to keep.
+    Application.DisplayAlerts = False
+    For Each wsToRemove In wbDest.Worksheets
+        If InStr(1, defaultSheetNames, "|" & wsToRemove.Name & "|", vbTextCompare) > 0 Then
+            wsToRemove.Delete
+        End If
+    Next wsToRemove
+    Application.DisplayAlerts = True
+
+    ' ---- 5. Walk every BOT row -------------------------------------------------
     For r = 2 To lastRowBOT
 
         tpnVal = GetVal(wsBOT, r, hdrBOT, BOT_HDR_TPN)
@@ -252,6 +266,21 @@ Sub ImportBOTPromoData()
 
 NextRow:
     Next r
+
+    ' ---- 6. Ask where to save the new output workbook -------------------------
+    Dim savePath As Variant
+    savePath = Application.GetSaveAsFilename( _
+        InitialFileName:=OUTPUT_FILE_PREFIX & ".xlsx", _
+        FileFilter:="Excel Workbook (*.xlsx),*.xlsx", _
+        Title:="Save the new Food - Promo Link EXIT Check workbook")
+
+    If VarType(savePath) = vbBoolean And savePath = False Then
+        MsgBox "Import finished but the new workbook was not saved - it is still " & _
+               "open as '" & wbDest.Name & "' so you don't lose the data; save it " & _
+               "manually when ready.", vbExclamation
+    Else
+        wbDest.SaveAs Filename:=CStr(savePath), FileFormat:=xlOpenXMLWorkbook
+    End If
 
     MsgBox "BOT import finished." & vbCrLf & vbCrLf & _
            "Main sheets  - added: " & addedMain & "   duplicates skipped: " & dupMain & vbCrLf & _
@@ -666,31 +695,20 @@ End Function
 
 
 '===================================================================================
-'  Find an already-open workbook whose name contains partialName, otherwise ask
-'  the user to browse for it and open it. The match ignores spaces/underscores so
-'  "PROMO COLLATION" matches both "PROMO COLLATION 11-09-2026.xlsx" and
-'  "BOT_Promo_Collation_....xlsx" style names.
+'  Always ask the user to browse for and select the BOT Promo Collation file
+'  (never silently reuses an already-open workbook, even if one looks like a
+'  match by name - the user explicitly wants to pick the file each run), then
+'  opens it. If the file is already open, Workbooks.Open just activates it
+'  rather than opening a second copy, so this is safe to run repeatedly.
 '===================================================================================
-Private Function GetOrOpenWorkbook(partialName As String) As Workbook
-    Dim wb As Workbook
-    Dim needle As String
+Private Function GetOrOpenWorkbook() As Workbook
     Dim fPath As Variant
 
-    needle = Replace(Replace(partialName, " ", ""), "_", "")
-
-    For Each wb In Application.Workbooks
-        If InStr(1, Replace(Replace(wb.Name, " ", ""), "_", ""), needle, vbTextCompare) > 0 Then
-            Set GetOrOpenWorkbook = wb
-            Exit Function
-        End If
-    Next wb
-
-    MsgBox "Please locate the BOT Promo Collation workbook.", vbInformation
     fPath = Application.GetOpenFilename( _
         FileFilter:="Excel Workbooks (*.xlsx;*.xlsm),*.xlsx;*.xlsm", _
         Title:="Select the BOT Promo Collation workbook")
 
-    If fPath = False Then
+    If VarType(fPath) = vbBoolean And fPath = False Then
         Set GetOrOpenWorkbook = Nothing
     Else
         Set GetOrOpenWorkbook = Workbooks.Open(CStr(fPath))
