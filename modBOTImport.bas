@@ -1,4 +1,3 @@
-# HHHHHyuuuuuyyuy
 Option Explicit
 
 '===================================================================================
@@ -49,6 +48,10 @@ Option Explicit
 '     TPN+Store+StartDate (main sheets) and TPN+Store (EXIT sheets) from the
 '     rows already in the sheet, so re-importing the same BOT export will
 '     not create duplicate rows.
+'
+'  MISSING HEADERS: if any BOT or destination header referenced below is not
+'  found on its sheet, ImportBOTPromoData aborts up front and lists exactly
+'  which ones are missing, rather than silently importing blank columns.
 '===================================================================================
 
 ' ---- Configuration you may want to tweak -----------------------------------------
@@ -97,6 +100,11 @@ Private Const EXIT_HDR_STORE     As String = "Store number"
 
 Private Const IMPORT_SUBJECT_TAG As String = "BOT Import"
 
+' Headers that MUST exist on the BOT sheet for the import to make sense.
+' (This list intentionally excludes DEST_HDR_ITEMDESC, which is HU-only.)
+Private Const REQUIRED_BOT_HEADERS As String = "tpn|storenumber|buyername|promonames|startdate|enddate|" & _
+    "Department description|Division description|DRG|DRG description|OOCP/CP|Reason|Item description|Country|CAYG"
+
 ' ---- Small helper type to bundle everything we need for one destination sheet ----
 Private Type TargetSheet
     ws          As Worksheet
@@ -128,6 +136,7 @@ Sub ImportBOTPromoData()
     Dim cagVal As Variant
     Dim addedMain As Long, dupMain As Long, addedExit As Long, dupExit As Long, unmapped As Long
     Dim unparsedWeeks As Long
+    Dim missingHeaders As String
 
     On Error GoTo CleanFail
     Application.ScreenUpdating = False
@@ -146,11 +155,16 @@ Sub ImportBOTPromoData()
 
     ' ---- 2. Read BOT headers and find last row --------------------------------
     Set hdrBOT = GetHeaderMap(wsBOT, 1)
-    If Not (hdrBOT.Exists(BOT_HDR_TPN) And hdrBOT.Exists(BOT_HDR_COUNTRYCD)) Then
-        MsgBox "The BOT workbook is missing expected headers ('tpn' / 'Country')." & vbCrLf & _
-               "Check the sheet layout hasn't changed.", vbCritical
+
+    missingHeaders = FindMissingHeaders(hdrBOT, Split(REQUIRED_BOT_HEADERS, "|"))
+    If Len(missingHeaders) > 0 Then
+        MsgBox "The BOT workbook is missing expected header(s):" & vbCrLf & vbCrLf & _
+               missingHeaders & vbCrLf & vbCrLf & _
+               "Check the sheet layout hasn't changed (header text/case must match exactly), " & _
+               "or update the BOT_HDR_* constants at the top of this module.", vbCritical
         GoTo CleanExit
     End If
+
     lastRowBOT = wsBOT.Cells(wsBOT.Rows.Count, hdrBOT(BOT_HDR_TPN)).End(xlUp).Row
 
     ' ---- 3. Prepare the six destination sheets --------------------------------
@@ -239,6 +253,24 @@ End Sub
 
 
 '===================================================================================
+'  Return a CrLf-joined list of any headers in requiredHeaders not present in hdr,
+'  or "" if all are present. Used to fail fast and loudly instead of silently
+'  importing blank columns (GetVal/WriteIfHeaderExists both fail silently by
+'  design, so this check has to happen up front).
+'===================================================================================
+Private Function FindMissingHeaders(hdr As Object, requiredHeaders As Variant) As String
+    Dim i As Long
+    Dim missing As String
+    For i = LBound(requiredHeaders) To UBound(requiredHeaders)
+        If Not hdr.Exists(requiredHeaders(i)) Then
+            missing = missing & "  - " & requiredHeaders(i) & vbCrLf
+        End If
+    Next i
+    FindMissingHeaders = missing
+End Function
+
+
+'===================================================================================
 '  Build a TargetSheet structure: header map, formula-column map, dedup keys
 '===================================================================================
 Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit As Boolean) As TargetSheet
@@ -246,18 +278,34 @@ Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit 
     Dim result As TargetSheet
     Dim ws As Worksheet
     Dim hdr As Object
-    Dim col As Long
+    Dim col As Long, lastCol As Long
     Dim anchorHeader As String
     Dim r As Long, lastRow As Long
     Dim tpnCol As Long, storeCol As Long, startCol As Long
     Dim k As String
+    Dim requiredHeaders As Variant
+    Dim missingHeaders As String
 
     Set ws = wb.Sheets(sheetName)
     Set hdr = GetHeaderMap(ws, 1)
+
+    If isExit Then
+        requiredHeaders = Array(EXIT_HDR_TPN, EXIT_HDR_STORE)
+    Else
+        requiredHeaders = Array(DEST_HDR_ITEM, DEST_HDR_LOCATION, DEST_HDR_STARTDATE)
+    End If
+    missingHeaders = FindMissingHeaders(hdr, requiredHeaders)
+    If Len(missingHeaders) > 0 Then
+        Err.Raise vbObjectError + 1, "PrepareTargetSheet", _
+            "Sheet '" & sheetName & "' is missing expected header(s):" & vbCrLf & missingHeaders
+    End If
+
     Set result.ws = ws
     Set result.headers = hdr
 
-    ' Which column anchors "how many rows already exist" - use TPN/Item, a plain value column
+    ' Which column anchors "how many rows already exist" - use TPN/Item, a plain value column.
+    ' A single-column End(xlUp) can understate lastRow if that one column has a stray blank
+    ' in an otherwise-populated row, so corroborate against the sheet's true last used row.
     If isExit Then
         anchorHeader = EXIT_HDR_TPN
     Else
@@ -265,16 +313,28 @@ Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit 
     End If
     result.anchorCol = hdr(anchorHeader)
     lastRow = ws.Cells(ws.Rows.Count, result.anchorCol).End(xlUp).Row
+
+    Dim usedLastRow As Long
+    On Error Resume Next
+    usedLastRow = ws.UsedRange.Rows(ws.UsedRange.Rows.Count).Row
+    On Error GoTo 0
+    If usedLastRow > lastRow Then lastRow = usedLastRow
+
     If lastRow < 1 Then lastRow = 1
     result.lastRow = lastRow
 
-    ' Detect which columns are formula-driven by checking row 2 (or the last data row)
+    ' Detect which columns are formula-driven by scanning every data row (not just row 2),
+    ' since a column's formula may not start until a later row (or row 2 may be blank/typed).
     Set result.formulaCols = CreateObject("Scripting.Dictionary")
     If lastRow >= 2 Then
-        For col = 1 To ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-            If ws.Cells(2, col).HasFormula Then
-                result.formulaCols.Add col, True
-            End If
+        lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+        For col = 1 To lastCol
+            For r = 2 To lastRow
+                If ws.Cells(r, col).HasFormula Then
+                    If Not result.formulaCols.Exists(col) Then result.formulaCols.Add col, True
+                    Exit For
+                End If
+            Next r
         Next col
     End If
 
@@ -318,22 +378,22 @@ Private Sub AddMainRow(ByRef t As TargetSheet, wsBOT As Worksheet, srcRow As Lon
     Set h = t.headers
     newRow = t.lastRow + 1
 
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_FROM, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_BUYER)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_ITEM, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_TPN)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_LOCATION, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_STORE)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_ITEMDESC, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_ITEMDESC) ' HU only
+    WriteIfHeaderExists t, newRow, DEST_HDR_FROM, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_BUYER)
+    WriteIfHeaderExists t, newRow, DEST_HDR_ITEM, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_TPN)
+    WriteIfHeaderExists t, newRow, DEST_HDR_LOCATION, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_STORE)
+    WriteIfHeaderExists t, newRow, DEST_HDR_ITEMDESC, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_ITEMDESC) ' HU only
     promoWeekText = CStr(GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_PROMONAME))
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_PROMOWEEK, promoWeekText
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_STARTDATE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_STARTDATE)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_ENDDATE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_ENDDATE)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_DEPT, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DEPTDESC)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_DIV, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DIVDESC)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_REASON, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_REASON)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_DRG, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRG)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_DRGNAME, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRGDESC)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_TYPE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_TYPE)
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_SUBJECT, IMPORT_SUBJECT_TAG
-    WriteIfHeaderExists ws, newRow, h, DEST_HDR_RECEIVED, Date
+    WriteIfHeaderExists t, newRow, DEST_HDR_PROMOWEEK, promoWeekText
+    WriteIfHeaderExists t, newRow, DEST_HDR_STARTDATE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_STARTDATE)
+    WriteIfHeaderExists t, newRow, DEST_HDR_ENDDATE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_ENDDATE)
+    WriteIfHeaderExists t, newRow, DEST_HDR_DEPT, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DEPTDESC)
+    WriteIfHeaderExists t, newRow, DEST_HDR_DIV, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DIVDESC)
+    WriteIfHeaderExists t, newRow, DEST_HDR_REASON, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_REASON)
+    WriteIfHeaderExists t, newRow, DEST_HDR_DRG, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRG)
+    WriteIfHeaderExists t, newRow, DEST_HDR_DRGNAME, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_DRGDESC)
+    WriteIfHeaderExists t, newRow, DEST_HDR_TYPE, GetVal(wsBOT, srcRow, hdrBOT, BOT_HDR_TYPE)
+    WriteIfHeaderExists t, newRow, DEST_HDR_SUBJECT, IMPORT_SUBJECT_TAG
+    WriteIfHeaderExists t, newRow, DEST_HDR_RECEIVED, Date
     ' "Promo num" and "Active Open Links in Stores" have no reliable source in BOT - left blank
 
     ' Minus week until promo starts
@@ -341,7 +401,7 @@ Private Sub AddMainRow(ByRef t As TargetSheet, wsBOT As Worksheet, srcRow As Lon
     If IsNull(minusWeek) Then
         unparsedWeeks = unparsedWeeks + 1
     Else
-        WriteIfHeaderExists ws, newRow, h, DEST_HDR_MINUSWK, minusWeek
+        WriteIfHeaderExists t, newRow, DEST_HDR_MINUSWK, minusWeek
     End If
 
     ' Preserve formulas: copy every formula-driven column down from the row above
@@ -366,8 +426,8 @@ Private Sub AddExitRow(ByRef t As TargetSheet, tpnVal As Variant, storeVal As Va
     Set h = t.headers
     newRow = t.lastRow + 1
 
-    WriteIfHeaderExists ws, newRow, h, EXIT_HDR_TPN, tpnVal
-    WriteIfHeaderExists ws, newRow, h, EXIT_HDR_STORE, storeVal
+    WriteIfHeaderExists t, newRow, EXIT_HDR_TPN, tpnVal
+    WriteIfHeaderExists t, newRow, EXIT_HDR_STORE, storeVal
 
     CopyFormulaColumnsDown t, newRow
 
@@ -395,11 +455,15 @@ End Sub
 '===================================================================================
 '  Write a value into a destination column only if that header exists on the
 '  sheet (CZ/SK don't have "Item Description"; several sheets don't use every
-'  header) - and never write into a column that is formula-driven.
+'  header) - and never write into a column that is formula-driven, since those
+'  are always populated via CopyFormulaColumnsDown instead.
 '===================================================================================
-Private Sub WriteIfHeaderExists(ws As Worksheet, rowNum As Long, hdr As Object, headerName As String, val As Variant)
-    If hdr.Exists(headerName) Then
-        ws.Cells(rowNum, hdr(headerName)).Value = val
+Private Sub WriteIfHeaderExists(ByRef t As TargetSheet, rowNum As Long, headerName As String, val As Variant)
+    Dim col As Long
+    If t.headers.Exists(headerName) Then
+        col = t.headers(headerName)
+        If t.formulaCols.Exists(col) Then Exit Sub
+        t.ws.Cells(rowNum, col).Value = val
     End If
 End Sub
 
@@ -427,6 +491,7 @@ Private Function GetHeaderMap(ws As Worksheet, headerRow As Long) As Object
     Dim h As String
 
     Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbBinaryCompare
     lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
 
     For c = 1 To lastCol
@@ -514,9 +579,35 @@ Private Function FiscalYearWeek(d As Date) As Variant
     FiscalYearWeek = Array(fy, Int((d - anchor) / 7) + 1)
 End Function
 
-' Converts (fiscalYear, fiscalWeek) into one comparable absolute number
+' Converts (fiscalYear, fiscalWeek) into one comparable absolute number of weeks
+' since a fixed epoch. Uses the ACTUAL number of fiscal weeks in each intervening
+' year (52 or 53 - a 53rd week occurs whenever the gap between that year's anchor
+' and the next year's anchor is 371 days instead of 364) rather than assuming every
+' fiscal year has exactly 52 weeks, so week counts stay correct across a 53-week year.
 Private Function AbsoluteWeekNumber(fiscalYear As Long, fiscalWeek As Long) As Long
-    AbsoluteWeekNumber = fiscalYear * 52 + fiscalWeek
+    Const EPOCH_YEAR As Long = 2000
+    Dim y As Long, total As Long
+
+    total = 0
+    If fiscalYear >= EPOCH_YEAR Then
+        For y = EPOCH_YEAR To fiscalYear - 1
+            total = total + WeeksInFiscalYear(y)
+        Next y
+    Else
+        For y = EPOCH_YEAR - 1 To fiscalYear Step -1
+            total = total - WeeksInFiscalYear(y)
+        Next y
+    End If
+
+    AbsoluteWeekNumber = total + fiscalWeek
+End Function
+
+' Number of fiscal weeks in a given fiscal year (52 in most years, 53 whenever the
+' anchor-to-anchor gap is 371 days rather than 364).
+Private Function WeeksInFiscalYear(fiscalYear As Long) As Long
+    Dim daysBetweenAnchors As Long
+    daysBetweenAnchors = CLng(FiscalAnchorForYear(fiscalYear + 1) - FiscalAnchorForYear(fiscalYear))
+    WeeksInFiscalYear = daysBetweenAnchors \ 7
 End Function
 
 
