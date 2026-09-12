@@ -64,11 +64,13 @@ Option Explicit
 '===================================================================================
 
 ' ---- Configuration you may want to tweak -----------------------------------------
-Private Const BOT_WORKBOOK_HINT As String = "Promo_Collation" ' partial file name to find/open
-                                                                ' (matches "BOT_Promo_Collation_..." and
-                                                                '  "Promo_Collation_Wednesday" etc. - if it
-                                                                '  can't find a match among open workbooks it
-                                                                '  just prompts you to browse for the file)
+Private Const BOT_WORKBOOK_HINT As String = "PROMO COLLATION" ' partial file name to find/open
+                                                                ' (matched space/underscore-insensitively by
+                                                                ' GetOrOpenWorkbook, so this also matches
+                                                                ' "PROMO_COLLATION_...", "Promo Collation
+                                                                ' Wednesday.xlsx" etc. - if it can't find a
+                                                                ' match among open workbooks it just prompts
+                                                                ' you to browse for the file)
 Private Const BOT_SHEET_NAME    As String = "Sheet1"
 
 Private Const BOT_HDR_TPN        As String = "tpn"
@@ -367,36 +369,44 @@ Private Function PrepareTargetSheet(wb As Workbook, sheetName As String, isExit 
 
     ' Which column anchors "how many rows already exist" - use TPN/Item, a plain value column.
     ' A single-column End(xlUp) can understate lastRow if that one column has a stray blank
-    ' in an otherwise-populated row, so corroborate against the sheet's true last used row.
+    ' in an otherwise-populated row, so take the max of End(xlUp) across every key column
+    ' that a real data row always has populated (Item/Location/StartDate, or TPN/Store for
+    ' EXIT sheets). NOTE: deliberately NOT corroborated against UsedRange - real sheets in
+    ' this workbook (e.g. "CZ") carry over 1,000 blank rows in UsedRange from old deleted/
+    ' formatted rows, which would push new data down into a large blank gap instead.
+    Dim keyCols As Variant, kc As Variant, thisLastRow As Long
     If isExit Then
         anchorHeader = EXIT_HDR_TPN
+        keyCols = Array(hdr(EXIT_HDR_TPN), hdr(EXIT_HDR_STORE))
     Else
         anchorHeader = DEST_HDR_ITEM
+        keyCols = Array(hdr(DEST_HDR_ITEM), hdr(DEST_HDR_LOCATION), hdr(DEST_HDR_STARTDATE))
     End If
     result.anchorCol = hdr(anchorHeader)
-    lastRow = ws.Cells(ws.Rows.Count, result.anchorCol).End(xlUp).Row
 
-    Dim usedLastRow As Long
-    On Error Resume Next
-    usedLastRow = ws.UsedRange.Rows(ws.UsedRange.Rows.Count).Row
-    On Error GoTo 0
-    If usedLastRow > lastRow Then lastRow = usedLastRow
+    lastRow = 0
+    For Each kc In keyCols
+        thisLastRow = ws.Cells(ws.Rows.Count, CLng(kc)).End(xlUp).Row
+        If thisLastRow > lastRow Then lastRow = thisLastRow
+    Next kc
 
     If lastRow < 1 Then lastRow = 1
     result.lastRow = lastRow
 
-    ' Detect which columns are formula-driven by scanning every data row (not just row 2),
-    ' since a column's formula may not start until a later row (or row 2 may be blank/typed).
+    ' Detect which columns are formula-driven by checking only the CURRENT last row -
+    ' this must match what CopyFormulaColumnsDown actually extends (always the row
+    ' directly above the new one). Some sheets (e.g. this workbook's CZ/HU tabs) have
+    ' an old historical band of rows where Division/DRG/Department were formulas and
+    ' every other row - including the current last row - has plain typed values;
+    ' scanning the whole column's history would wrongly treat those as formula-driven
+    ' forever and silently drop real imported values for new rows.
     Set result.formulaCols = CreateObject("Scripting.Dictionary")
     If lastRow >= 2 Then
         lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
         For col = 1 To lastCol
-            For r = 2 To lastRow
-                If ws.Cells(r, col).HasFormula Then
-                    If Not result.formulaCols.Exists(col) Then result.formulaCols.Add col, True
-                    Exit For
-                End If
-            Next r
+            If ws.Cells(lastRow, col).HasFormula Then
+                result.formulaCols.Add col, True
+            End If
         Next col
     End If
 
@@ -657,14 +667,19 @@ End Function
 
 '===================================================================================
 '  Find an already-open workbook whose name contains partialName, otherwise ask
-'  the user to browse for it and open it.
+'  the user to browse for it and open it. The match ignores spaces/underscores so
+'  "PROMO COLLATION" matches both "PROMO COLLATION 11-09-2026.xlsx" and
+'  "BOT_Promo_Collation_....xlsx" style names.
 '===================================================================================
 Private Function GetOrOpenWorkbook(partialName As String) As Workbook
     Dim wb As Workbook
+    Dim needle As String
     Dim fPath As Variant
 
+    needle = Replace(Replace(partialName, " ", ""), "_", "")
+
     For Each wb In Application.Workbooks
-        If InStr(1, wb.Name, partialName, vbTextCompare) > 0 Then
+        If InStr(1, Replace(Replace(wb.Name, " ", ""), "_", ""), needle, vbTextCompare) > 0 Then
             Set GetOrOpenWorkbook = wb
             Exit Function
         End If
